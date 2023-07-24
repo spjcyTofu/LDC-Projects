@@ -1,0 +1,161 @@
+#-------------------------------------------------------------------------------
+# Functions
+#-------------------------------------------------------------------------------
+
+$config = ""
+$configvals = Get-Content -Path $config | ConvertFrom-Json
+
+#Creating a logfile
+$Stamp = (Get-Date).toString("yyyy-MM-dd_HH-mm-ss")
+$Logfile = ""
+
+#Function Logwrite to write within the logfile
+Function LogWrite
+{
+   Param ([string]$logstring)
+   $logmessage = "$Stamp : $logstring"
+   Add-content $Logfile -value $logmessage
+}
+
+#Starting Logfile
+$intro = "Starting Logfile for CSM " + $configvals.environment.ToUpper() + " Smoketest"
+LogWrite $intro
+
+Function Set-FieldValue
+{
+    [CmdletBinding()]
+    Param(
+        [Parameter(Position=0, Mandatory=$True)]
+            [PSCustomObject]$template
+        ,[Parameter(Position=0, Mandatory=$True)]
+            [String]$fieldName
+        ,[Parameter(Position=0, Mandatory=$True)]
+            [String]$value
+    )
+
+    $field = $template.fields | Where-Object {$_.name -eq $fieldName}
+
+    if (!$field)
+    {
+        throw [System.Exception]"fieldName does not exist in template"
+    }
+
+    $field.value = $value
+    $field.dirty = $true
+}
+
+#-------------------------------------------------------------------------------
+# Get Customer Data
+#-------------------------------------------------------------------------------
+
+try {
+    # Get an access token
+    $baseUri = "https://" + $configvals.serverName + "/CherwellAPI/"
+    $tokenUri = $baseUri + "token"
+    $authMode = "Internal"
+    $tokenRequestBody =
+    @{
+        "Accept" = "application/json";
+        "grant_type" = "password";
+        "client_id" = $configvals.apiKey;
+        "username" = $configvals.userName;
+        "password"= $configvals.password
+    }
+
+    LogWrite "Invoking Rest Method - POST" 
+    $tokenResponse = Invoke-RestMethod -Method POST -Uri "${tokenUri}?auth_mode=${authMode}&api_key=${configvals.apiKey}" -Body $tokenRequestBody
+    $requestHeader = @{ Authorization = "Bearer $($tokenResponse.access_token)" }
+    LogWrite "Post Method Successful"
+}
+catch {
+    LogWrite "Error occurred while getting access token: $_"
+    # Handle the error or throw an exception if required
+}
+
+try {
+    # Get the business object summary for customer internal
+    $summaryUri = $baseUri + "api/V1/getbusinessobjectsummaries/type/All"
+    $summaryResults = Invoke-RestMethod -Method GET -Uri $summaryUri -ContentType application/json -Header $requestHeader
+
+    $summaryCount = $summaryResults.Count
+    $summaryNum = Get-Random -Maximum $summaryCount
+
+    $busobId = $summaryResults[$summaryNum].busobId
+
+    LogWrite "Summary Results BusobId created"
+
+    # Get the business object schema for customer internal
+    $schemaUri = $baseUri + "api/V1/getbusinessobjectschema/busobid/$busobid"
+    LogWrite "SchemaURI"
+    LogWrite $schemaUri
+    $schemaResults = Invoke-RestMethod -Method GET -Uri $schemaUri -ContentType application/json -Header $requestHeader
+    LogWrite "Business Object Schema successful get"
+
+    #Create the body for the search
+    $searchResultsRequest =
+    @{
+        busObID = $busobId;
+    } | ConvertTo-Json
+
+    # Run the search
+    $searchUri = $baseUri + "api/V1/getquicksearchresults"
+    $searchResponse = Invoke-RestMethod -Method POST -Uri $searchUri -ContentType application/json -Header $requestHeader -Body $searchResultsRequest
+    LogWrite "Search Successful"
+
+    # Set the recid to be used in the creation of the incident
+    $customerRecId = $searchResponse.groups[0].simpleResultsListItems[0].busObRecId
+
+    # Get the business object summary for incident
+    $summaryUri = $baseUri + "api/V1/getbusinessobjectsummary/busobname/Incident"
+    $summaryResponse = Invoke-RestMethod -Method GET -Uri $summaryUri -ContentType application/json -Header $requestHeader
+    $busobId = $summaryResponse[0].busobId
+    LogWrite "Business Object Summary Successful GET"
+}
+catch {
+    LogWrite "Error occurred while getting customer data: $_"
+    # Handle the error or throw an exception if required
+}
+
+try {
+    # Create request for the business object template POST method
+    $getTemplateUri = $baseUri + "api/V1/GetBusinessObjectTemplate"
+    $templateRequest =
+    @{
+        busObId = $busobId;
+        includeRequired = $true;
+        includeAll = $true
+    } | ConvertTo-Json
+    $templateResponse = Invoke-RestMethod -Method POST -Uri $getTemplateUri -Header $requestHeader -ContentType application/json -Body $templateRequest
+
+    # Set values in the template
+    Set-FieldValue -template $templateResponse -fieldName "Status" -value "New"
+    Set-FieldValue -template $templateResponse -fieldName "Description" -value "TESTING TESTING TESTING TESTING"
+    Set-FieldValue -template $templateResponse -fieldName "ShortDescription" -value "Smoketest Testing"
+}
+catch {
+    LogWrite "Error occurred while creating the business object template: $_"
+    # Handle the error or throw an exception if required
+}
+
+try {
+    # Get the fields portion of the template and use it in the request for a new BO
+    $createBOUri = $baseuri + "api/V1/SaveBusinessObject"
+    $createBORequest =
+    @{
+        busObId = $busobId;
+        fields = @($($templateResponse.fields))
+    } | ConvertTo-Json
+
+    # Submit business object to server
+    $createBOResponse = Invoke-RestMethod -Method POST -Uri $createBOUri -Header $requestHeader -ContentType application/json -Body $createBORequest
+    LogWrite "Ticket Incident Created"
+
+    $clientUri = ""
+    Start-Process $clientUri
+    LogWrite "Public ID"
+    LogWrite $createBOResponse.busObPublicId
+}
+catch {
+    LogWrite "Error occurred while creating a new business object: $_"
+    # Handle the error or throw an exception if required
+}
